@@ -1,5 +1,7 @@
 -- =====================================================
--- Safe Bite AI - MySQL Database Schema
+-- Safe Bite AI - SQLite Database Schema
+-- Idempotent: applied automatically on every app start (see init_db in app.py).
+-- Allergen / alias / E-number seed data lives in seed_data.py.
 -- =====================================================
 
 
@@ -95,7 +97,7 @@ VALUES
 ('sucralose',               'E955', 'sweetener',   'low',    'Generally safe, gut bacteria concerns',         'moderate','safe','safe',  'safe',     0,0),
 ('high fructose corn syrup','',     'sweetener',   'high',   'Obesity, diabetes, liver issues',               'limit','limit','limit',   'limit',    0,0),
 -- Fats
-('palm oil',                '',     'fat',         'medium', 'High saturated fat, cardiovascular concerns',   'limit','moderate','moderate','moderate',1,1),
+('palm oil',                '',     'fat',         'medium', 'High saturated fat, cardiovascular concerns',   'limit','moderate','moderate','moderate',0,0),
 ('hydrogenated oil',        '',     'fat',         'high',   'Trans fats, heart disease',                     'avoid','avoid','limit',   'limit',    0,0),
 ('partially hydrogenated oil','',   'fat',         'high',   'Trans fats, cardiovascular risks',              'avoid','avoid','limit',   'limit',    0,0),
 -- Flavors
@@ -149,7 +151,7 @@ CREATE TABLE IF NOT EXISTS product_analysis (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     product_id      INT NULL,
     user_id         INT,
-    safety_score    INTEGER NOT NULL,   -- 0-100
+    safety_score    INTEGER NOT NULL,   -- 0-10
     status          TEXT NOT NULL,
     age_group       TEXT DEFAULT 'adult',
     detected_flags  TEXT,           -- list of flagged ingredient ids
@@ -205,7 +207,39 @@ INSERT OR IGNORE INTO products (name, brand, barcode, category, raw_ingredients)
 -- ─────────────────────────────────────────
 -- INDEXES for performance
 -- ─────────────────────────────────────────
-CREATE INDEX idx_scan_user      ON scan_history(user_id);
-CREATE INDEX idx_analysis_prod  ON product_analysis(product_id);
-CREATE INDEX idx_prod_barcode   ON products(barcode);
-CREATE INDEX idx_ingr_name      ON ingredients(name);
+CREATE INDEX IF NOT EXISTS idx_scan_user      ON scan_history(user_id);
+CREATE INDEX IF NOT EXISTS idx_analysis_prod  ON product_analysis(product_id);
+CREATE INDEX IF NOT EXISTS idx_prod_barcode   ON products(barcode);
+CREATE INDEX IF NOT EXISTS idx_ingr_name      ON ingredients(name);
+
+-- ─────────────────────────────────────────
+-- 11. INGREDIENT ALIASES (synonyms, plurals, alternative names)
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ingredient_aliases (
+    alias         VARCHAR(200) PRIMARY KEY,
+    ingredient_id INT NOT NULL,
+    FOREIGN KEY (ingredient_id) REFERENCES ingredients(id) ON DELETE CASCADE
+);
+
+-- ─────────────────────────────────────────
+-- 12. REVOKED TOKENS (server-side logout)
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS revoked_tokens (
+    jti        VARCHAR(64) PRIMARY KEY,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_revoked_exp ON revoked_tokens(expires_at);
+
+-- ─────────────────────────────────────────
+-- DATA FIXES for databases created by older versions
+-- ─────────────────────────────────────────
+UPDATE ingredients SET is_vegan_unsafe = 0, is_vegetarian_unsafe = 0 WHERE name = 'palm oil';
+
+UPDATE products SET image_url = '/products/kombucha.png'      WHERE barcode = 'PB-001' AND image_url IS NULL;
+UPDATE products SET image_url = '/products/cola_drink.png'    WHERE barcode = 'GN-002' AND image_url IS NULL;
+UPDATE products SET image_url = '/products/potato_chips.png'  WHERE barcode = 'GN-003' AND image_url IS NULL;
+UPDATE products SET image_url = '/products/energy_drink.png'  WHERE barcode = 'GN-004' AND image_url IS NULL;
+UPDATE products SET image_url = '/products/fruit_candy.png'   WHERE barcode = 'GN-005' AND image_url IS NULL;
+UPDATE products SET image_url = '/products/chocolate_bar.png' WHERE barcode = 'GN-006' AND image_url IS NULL;
+UPDATE products SET image_url = '/products/instant_ramen.png' WHERE barcode = 'GN-007' AND image_url IS NULL;
+UPDATE products SET image_url = '/products/fruity_cereal.png' WHERE barcode = 'GN-008' AND image_url IS NULL;

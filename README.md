@@ -1,7 +1,7 @@
 # 🥗 Safe Bite AI — Full Stack Setup Guide
 
 > Smart Food Label & Allergy Risk Detection System  
-> **Stack:** Next.js 14 · TypeScript · Tailwind CSS · Flask · MySQL · Tesseract OCR
+> **Stack:** Next.js 16 · React 19 · TypeScript · Tailwind CSS · Flask · SQLite · Tesseract OCR
 
 ---
 
@@ -25,173 +25,103 @@ safebite/
 │   │   └── SafetyScoreCard.tsx
 │   ├── lib/
 │   │   └── api.ts             ← All API calls + TypeScript types
-│   ├── .env.local             ← NEXT_PUBLIC_API_URL
+│   ├── .env.example           ← NEXT_PUBLIC_API_URL (copy to .env.local)
 │   ├── next.config.js
 │   ├── postcss.config.js
 │   ├── tailwind.config.ts
 │   ├── tsconfig.json
 │   └── package.json
 └── backend/                   ← Flask REST API
-    ├── app.py                 ← All routes + safety engine + OCR
+    ├── app.py                 ← Routes, auth, OCR
+    ├── safety_engine.py       ← Parsing, matching, scoring
+    ├── seed_data.py           ← Allergens, aliases, animal-derived data
+    ├── tests/                 ← pytest regression suite
     ├── requirements.txt       ← Python dependencies
-    └── schema.sql             ← MySQL database schema
+    └── schema.sql             ← SQLite schema (auto-applied on start)
 ```
 
 ---
 
 ## ⚙️ Prerequisites
 
-| Tool | Version | Install |
-|------|---------|---------|
-| Node.js | 18 + | https://nodejs.org |
-| Python | 3.10 + | https://python.org |
-| MySQL | 8.0 + | https://dev.mysql.com |
-| Tesseract OCR | 5.x | See below |
+| Tool | Version |
+|------|---------|
+| Node.js | 20+ (22 recommended) |
+| Python | 3.12 |
+| Tesseract OCR | 5.x |
+
+The backend uses **SQLite**. The database file is created and seeded automatically on first start, so no manual DB setup is needed.
 
 ### Install Tesseract OCR
 
-**macOS**
-```bash
-brew install tesseract
-```
-
-**Ubuntu / Debian**
-```bash
-sudo apt update && sudo apt install -y tesseract-ocr
-```
-
-**Windows**
-Download installer: https://github.com/UB-Mannheim/tesseract/wiki  
-Add to PATH: `C:\Program Files\Tesseract-OCR`
+- **macOS:** `brew install tesseract`
+- **Ubuntu / Debian:** `sudo apt install -y tesseract-ocr`
+- **Windows:** https://github.com/UB-Mannheim/tesseract/wiki (default path `C:\Program Files\Tesseract-OCR` is auto-detected)
 
 ---
 
-## 🗄️ 1. Database Setup (MySQL)
+## 🐍 1. Backend (Flask)
 
 ```bash
-# Log into MySQL
-mysql -u root -p
-
-# Create database and user
-CREATE DATABASE safebite_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER 'safebite'@'localhost' IDENTIFIED BY 'safebite123';
-GRANT ALL PRIVILEGES ON safebite_db.* TO 'safebite'@'localhost';
-FLUSH PRIVILEGES;
-EXIT;
-
-# Import schema
-mysql -u safebite -p safebite_db < backend/schema.sql
-```
-
----
-
-## 🐍 2. Backend Setup (Flask)
-
-```bash
-# Navigate to backend
 cd backend
-
-# Create and activate virtual environment
 python -m venv venv
+source venv/bin/activate          # Windows: venv\Scriptsctivate
+pip install -r requirements-dev.txt
 
-# macOS / Linux
-source venv/bin/activate
+cp .env.example .env              # Windows: copy .env.example .env
+python -c "import secrets; print(secrets.token_urlsafe(48))"   # paste into JWT_SECRET in .env
 
-# Windows
-venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
+python app.py                     # http://localhost:5000/api/health
 ```
 
-### Configure environment variables
+The app **refuses to start** without a `JWT_SECRET` of at least 32 characters.
 
-Create a `.env` file inside `backend/`:
-
-```env
-DB_HOST=localhost
-DB_USER=safebite
-DB_PASS=safebite123
-DB_NAME=safebite_db
-JWT_SECRET=your-super-secret-key-change-in-production
-```
-
-### Run the Flask server
+Run the tests:
 
 ```bash
-# Development (auto-reload)
-python app.py
-
-# OR with Flask CLI
-flask --app app run --debug --port 5000
+python -m pytest -q
 ```
 
-Flask will be live at: **http://localhost:5000**
-
-Verify: http://localhost:5000/api/health → `{"status":"ok","version":"1.0.0"}`
-
----
-
-## ⚡ 3. Frontend Setup (Next.js)
+## ⚡ 2. Frontend (Next.js)
 
 ```bash
-# Navigate to frontend
 cd frontend
-
-# Install dependencies
+cp .env.example .env.local        # NEXT_PUBLIC_API_URL=http://localhost:5000/api
 npm install
-
-# Verify .env.local has correct backend URL
-cat .env.local
-# Should output: NEXT_PUBLIC_API_URL=http://localhost:5000/api
+npm run dev                       # http://localhost:3000
 ```
 
-### Run the development server
-
-```bash
-npm run dev
-```
-
-App will be live at: **http://localhost:3000**
+Checks: `npm run typecheck`, `npm run lint`, `npm run build`.
 
 ---
 
-## 🚀 Running Both Together
+## 📦 Production
 
-Open **two terminal windows**:
+### Docker (recommended)
 
-**Terminal 1 — Backend**
 ```bash
-cd backend
-source venv/bin/activate      # or venv\Scripts\activate on Windows
-python app.py
+cp backend/.env.example backend/.env   # set JWT_SECRET, CORS_ORIGINS
+docker compose up --build
 ```
 
-**Terminal 2 — Frontend**
-```bash
-cd frontend
-npm run dev
-```
+- **backend/Dockerfile:** Python 3.12 + Tesseract, non-root user, gunicorn, SQLite stored on the `/data` volume
+- **frontend/Dockerfile:** Next.js standalone build. `NEXT_PUBLIC_API_URL` is a **build argument**.
+- **redis:** shared rate-limit storage for multiple gunicorn workers/instances
 
-Then open **http://localhost:3000** in your browser.
+### Production checklist
 
----
+- [ ] `JWT_SECRET` set from a secret manager (never committed)
+- [ ] `CORS_ORIGINS` = your real frontend URL only
+- [ ] HTTPS in front of both services; `TRUST_PROXY=1` when behind a load balancer
+- [ ] `RATELIMIT_STORAGE_URI=redis://...` when running more than one worker or instance
+- [ ] Persistent volume + backups for `DATABASE_PATH` (or migrate to PostgreSQL for multi-instance scale)
+- [ ] `FLASK_DEBUG` unset or `0`
+- [ ] Liveness probe `/api/health`, readiness probe `/api/ready`
 
-## 📦 Production Build
+### Hosting options
 
-### Frontend
-```bash
-cd frontend
-npm run build      # Compiles + optimises
-npm run start      # Serves production build on port 3000
-```
-
-### Backend (with Gunicorn)
-```bash
-cd backend
-pip install gunicorn
-gunicorn -w 4 -b 0.0.0.0:5000 app:app
-```
+- **Simple:** Vercel (frontend) + Render / Railway / Fly.io (backend Docker image with a disk)
+- **AWS:** Amplify or CloudFront (frontend) + App Runner / ECS Fargate (backend) + EFS volume or RDS
 
 ---
 
@@ -214,17 +144,20 @@ gunicorn -w 4 -b 0.0.0.0:5000 app:app
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
 | POST | `/api/auth/register` | ❌ | Create account |
-| POST | `/api/auth/login` | ❌ | Get JWT token |
+| POST | `/api/auth/login` | ❌ | Get JWT token (rate limited) |
+| POST | `/api/auth/logout` | ✅ | Revoke current token |
 | GET | `/api/user/profile` | ✅ | Fetch profile |
 | PUT | `/api/user/profile` | ✅ | Update profile + restrictions |
 | GET | `/api/products` | ❌ | List products |
 | GET | `/api/products/barcode/:code` | ❌ | Find by barcode |
 | POST | `/api/analyze/text` | ✅ | Analyse typed ingredients |
-| POST | `/api/analyze/image` | ✅ | Analyse image (base64) |
+| POST | `/api/analyze/image` | ✅ | Analyse image (multipart `image` or JSON `image_base64`) |
 | POST | `/api/analyze/product/:id` | ✅ | Analyse DB product |
 | GET | `/api/history` | ✅ | Scan history |
 | GET | `/api/ingredients` | ❌ | Ingredients reference |
-| GET | `/api/health` | ❌ | Health check |
+| GET | `/api/restrictions` | ❌ | Supported allergy / diet / health restrictions |
+| GET | `/api/health` | ❌ | Liveness check |
+| GET | `/api/ready` | ❌ | Readiness (DB + OCR) |
 
 ---
 
@@ -233,7 +166,8 @@ gunicorn -w 4 -b 0.0.0.0:5000 app:app
 1. Register / login → receive JWT token
 2. Token stored in `localStorage` as `safebite_token`
 3. All `✅` endpoints require `Authorization: Bearer <token>` header
-4. Token expires after **24 hours**
+4. Token expires after **24 hours** (`TOKEN_EXPIRY_HOURS`); logout revokes it on the server
+5. Any `401` response clears the session and redirects to `/login`
 
 ---
 
@@ -254,27 +188,30 @@ All design tokens are defined in `tailwind.config.ts`:
 
 ---
 
+## 🧠 How the safety score works (`backend/safety_engine.py`)
+
+1. **Parse:** split the label text. Bracketed sub-ingredients are kept, E-numbers and INS codes (`E102`, `INS 102`, `(102)`) are normalised, and negations (`non-hydrogenated`, `msg free`) are ignored.
+2. **Match:** compare against ingredient names, aliases (e.g. maida → wheat, vanaspati → hydrogenated oil, whey → milk) and E-numbers. The longest name wins, so `cocoa butter` is never read as dairy `butter`.
+3. **Score (0–10):** the worst flagged ingredient counts fully and each additional one counts 70% of the previous. Adding harmless ingredients cannot dilute the risk.
+4. **Overrides:** an allergen matching the user's profile caps the score at 1 (**unsafe**). A diet conflict (vegan/vegetarian) caps it at 3.
+
+Reference data lives in `schema.sql` (additives) and `seed_data.py` (allergens, aliases, animal-derived ingredients). Both are applied idempotently on every start.
+
+---
+
 ## 🐛 Troubleshooting
 
-**`pytesseract.TesseractNotFoundError`**  
-→ Tesseract is not in PATH. Run `tesseract --version` to verify. On Windows set the full path in `app.py`:
-```python
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-```
+**`RuntimeError: JWT_SECRET must be set`**: create `backend/.env` from `.env.example` and set a long random secret.
 
-**`Access to fetch blocked by CORS`**  
-→ Ensure Flask is running on port 5000 and `.env.local` has `NEXT_PUBLIC_API_URL=http://localhost:5000/api`
+**`OCR is not available on this server`**: Tesseract isn't installed or found. Set `TESSERACT_CMD` in `backend/.env`.
 
-**`Can't connect to MySQL`**  
-→ Check `DB_HOST`, `DB_USER`, `DB_PASS`, `DB_NAME` in `backend/.env`
+**CORS errors in the browser**: add your frontend origin to `CORS_ORIGINS` in `backend/.env`.
 
-**`Module not found: @/components/...`**  
-→ Ensure `tsconfig.json` has `"paths": { "@/*": ["./*"] }` — already set.
+**`429 Too many requests`**: rate limit hit. Limits are configurable in `backend/.env`.
 
 ---
 
 ## 📝 Notes
 
-- Analysis results are stored in `sessionStorage` under `safebite_result` — they clear when the browser tab closes.
-- The safety score formula: `score = max(0, 100 - (total_risk / 60) * 100)` — tune the `60` divisor in `app.py` to adjust sensitivity.
-- Add seed ingredient data via `schema.sql` or through the MySQL CLI for meaningful scan results.
+- Analysis results are kept in `sessionStorage` under `safebite_result` and are cleared on logout or when the tab closes.
+- SafeBite AI is informational only and not medical advice. Users with severe allergies must always read the printed label.

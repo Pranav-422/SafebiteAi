@@ -20,9 +20,12 @@ export default function ProductsPage() {
   const [ageGroup, setAgeGroup] = useState<AgeGroup>("adult");
   const [selected, setSelected] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    getProducts(cat === "All" ? undefined : cat).then(setProducts).catch(() => {});
+    getProducts(cat === "All" ? undefined : cat)
+      .then((p) => { setProducts(p); setError(null); })
+      .catch((e: Error) => setError(e.message));
   }, [cat]);
 
   const selectedProduct = useMemo(
@@ -33,12 +36,13 @@ export default function ProductsPage() {
   async function handleAnalyze() {
     if (!selected) return;
     setLoading(true);
+    setError(null);
     try {
       const result = await analyzeProduct(selected, ageGroup);
       sessionStorage.setItem("safebite_result", JSON.stringify(result));
       router.push("/report");
-    } catch {
-      alert("Analysis failed. Please try again.");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Analysis failed. Please try again.");
     } finally {
       setLoading(false);
     }
@@ -55,6 +59,9 @@ export default function ProductsPage() {
           </div>
           <h1 className="font-headline text-4xl text-on-surface mb-2">Product Catalog</h1>
           <p className="text-on-surface-variant font-body">Pick a product, choose age group, and generate a safety report.</p>
+          {error && (
+            <p role="alert" className="mt-4 px-4 py-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm font-body">{error}</p>
+          )}
         </header>
 
         <section className="grid grid-cols-1 xl:grid-cols-12 gap-6">

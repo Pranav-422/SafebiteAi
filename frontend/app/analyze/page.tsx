@@ -19,7 +19,12 @@ type Restriction =
   | "vegetarian"
   | "nut_allergy"
   | "lactose_intolerant"
-  | "gluten_intolerant";
+  | "gluten_intolerant"
+  | "egg_allergy"
+  | "soy_allergy"
+  | "fish_allergy"
+  | "shellfish_allergy"
+  | "sesame_allergy";
 
 const RESTRICTIONS: { key: Restriction; label: string; icon: string; color: string }[] = [
   { key: "diabetic",           label: "Diabetic",          icon: "glucose",          color: "text-amber-600"   },
@@ -29,6 +34,11 @@ const RESTRICTIONS: { key: Restriction; label: string; icon: string; color: stri
   { key: "nut_allergy",        label: "Nut Allergy",       icon: "dangerous",        color: "text-orange-500"  },
   { key: "lactose_intolerant", label: "Lactose Intolerant",icon: "no_drinks",        color: "text-sky-600"     },
   { key: "gluten_intolerant",  label: "Gluten Intolerant", icon: "do_not_disturb_on",color: "text-rose-500"    },
+  { key: "egg_allergy",        label: "Egg Allergy",       icon: "egg",              color: "text-yellow-600"  },
+  { key: "soy_allergy",        label: "Soy Allergy",       icon: "spa",              color: "text-lime-600"    },
+  { key: "fish_allergy",       label: "Fish Allergy",      icon: "set_meal",         color: "text-cyan-600"    },
+  { key: "shellfish_allergy",  label: "Shellfish Allergy", icon: "phishing",         color: "text-teal-600"    },
+  { key: "sesame_allergy",     label: "Sesame Allergy",    icon: "grain",            color: "text-stone-600"   },
 ];
 
 const EXAMPLE_TEXT =

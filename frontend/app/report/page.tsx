@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useMemo, useSyncExternalStore } from "react";
 import { useRouter } from "next/navigation";
 import Navbar from "@/components/Navbar";
 import SafetyScoreCard from "@/components/SafetyScoreCard";
@@ -12,6 +12,8 @@ const RISK_CONFIG = {
   low: { bg: "bg-yellow-50", text: "text-yellow-700", border: "border-yellow-200", dot: "bg-yellow-400", label: "Low Risk" },
   safe: { bg: "bg-emerald-50", text: "text-emerald-700", border: "border-emerald-200", dot: "bg-emerald-500", label: "Safe" },
 };
+
+const subscribeNoop = () => () => {};
 
 function DeltaBadge({ delta }: { delta: number }) {
   if (delta === 0) return null;
@@ -81,21 +83,21 @@ function AlternativeCard({ alt }: { alt: Alternative }) {
 
 export default function ReportPage() {
   const router = useRouter();
-  const [result, setResult] = useState<AnalysisResult | null>(null);
-  const [notFound, setNotFound] = useState(false);
-
-  useEffect(() => {
+  // Read the last analysis from sessionStorage without setState-in-effect (server snapshot = not loaded yet).
+  const raw = useSyncExternalStore(
+    subscribeNoop,
+    () => sessionStorage.getItem("safebite_result") ?? "",
+    () => null
+  );
+  const result = useMemo<AnalysisResult | null>(() => {
+    if (!raw) return null;
     try {
-      const raw = sessionStorage.getItem("safebite_result");
-      if (!raw) {
-        setNotFound(true);
-        return;
-      }
-      setResult(JSON.parse(raw) as AnalysisResult);
+      return JSON.parse(raw) as AnalysisResult;
     } catch {
-      setNotFound(true);
+      return null;
     }
-  }, []);
+  }, [raw]);
+  const notFound = raw !== null && result === null;
 
   if (notFound) {
     return (
@@ -154,6 +156,39 @@ export default function ReportPage() {
         </aside>
 
         <div className="space-y-10 xl:col-span-8">
+          {/* Allergen alerts – shown first, they override the score */}
+          {(result.allergen_alerts?.length ?? 0) > 0 && (
+            <section role="alert" className="rounded-2xl border-2 border-red-300 bg-red-50 p-5 space-y-3 fade-in">
+              <h2 className="font-headline text-xl text-red-700 flex items-center gap-2">
+                <span className="material-symbols-outlined" style={{ fontVariationSettings: "'FILL' 1" }}>emergency</span>
+                Allergen warning
+              </h2>
+              <ul className="space-y-1.5 text-sm text-red-800 font-body">
+                {result.allergen_alerts!.map((a) => (
+                  <li key={`${a.ingredient}-${a.allergen}`} className="flex gap-2">
+                    <span className="font-bold capitalize">{a.ingredient}</span>
+                    <span>
+                      {a.trace ? "may contain" : "contains"} {a.allergen.replace(/_/g, " ")} — your profile:{" "}
+                      {a.restriction.replace(/_/g, " ")}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {(result.diet_conflicts?.length ?? 0) > 0 && (
+            <section className="rounded-2xl border border-amber-300 bg-amber-50 p-5 space-y-2 fade-in">
+              <h2 className="font-headline text-lg text-amber-800 flex items-center gap-2">
+                <span className="material-symbols-outlined">no_food</span>
+                Not suitable for your diet
+              </h2>
+              <p className="text-sm text-amber-900 font-body">
+                {result.diet_conflicts!.map((d) => `${d.ingredient} (${d.restriction})`).join(", ")}
+              </p>
+            </section>
+          )}
+
           {/* Score header */}
           <section className="forest-card overflow-hidden">
             <div className="gradient-bg px-6 pt-8 pb-2 text-center">
@@ -236,7 +271,10 @@ export default function ReportPage() {
                 check_circle
               </span>
               <p className="font-headline text-lg text-emerald-700">No concerning ingredients found.</p>
-              <p className="text-emerald-600 text-sm max-w-xs font-body">All {result.total_ingredients} ingredients appear safe based on your profile.</p>
+              <p className="text-emerald-600 text-sm max-w-sm font-body">
+                None of the {result.total_ingredients} ingredients matched our list of concerning additives or your
+                profile restrictions.
+              </p>
             </div>
           )}
 
@@ -254,6 +292,11 @@ export default function ReportPage() {
               </div>
             </section>
           )}
+
+          <p className="text-xs text-on-surface-variant font-body leading-relaxed">
+            SafeBite AI is an informational tool and can miss ingredients (especially with OCR). It is not medical
+            advice. If you have a severe allergy, always read the full printed label and consult your doctor.
+          </p>
 
           {/* Action buttons */}
           <div className="flex flex-col sm:flex-row gap-3 pt-2">

@@ -42,3 +42,10 @@ mariadb-data/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Build artifacts
+*.tsbuildinfo
+.venv*/
+
+# Local SQLite database
+backend/safebite.db*

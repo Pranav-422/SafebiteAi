@@ -3,13 +3,16 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Navbar from "@/components/Navbar";
-import { analyzeImageBase64, AgeGroup } from "@/lib/api";
+import { analyzeImage, AgeGroup } from "@/lib/api";
 
 const AGE_GROUPS: { value: AgeGroup; icon: string; label: string; sub: string }[] = [
   { value: "child", icon: "child_care", label: "Child", sub: "Ages 0-12. Strict toxicity thresholds." },
   { value: "teen", icon: "school", label: "Teen", sub: "Ages 13-19. Focus on hormonal health." },
   { value: "adult", icon: "person", label: "Adult", sub: "Ages 20+. Balanced safety profile." },
+  { value: "senior", icon: "elderly", label: "Senior", sub: "Ages 60+. Extra caution." },
 ];
+
+const MAX_UPLOAD_MB = 8;
 
 export default function ScanPage() {
   const router = useRouter();
@@ -21,6 +24,14 @@ export default function ScanPage() {
   const [dragOver, setDragOver] = useState(false);
 
   function handleFile(f: File) {
+    if (!f.type.startsWith("image/")) {
+      setError("Please choose an image file (JPG, PNG, WEBP).");
+      return;
+    }
+    if (f.size > MAX_UPLOAD_MB * 1024 * 1024) {
+      setError(`Image is too large (max ${MAX_UPLOAD_MB} MB).`);
+      return;
+    }
     setFile(f);
     setError(null);
     const reader = new FileReader();
@@ -36,12 +47,11 @@ export default function ScanPage() {
   }
 
   async function handleScan() {
-    if (!preview) return;
+    if (!file) return;
     setLoading(true);
     setError(null);
     try {
-      const base64 = preview.split(",")[1];
-      const result = await analyzeImageBase64(base64, ageGroup);
+      const result = await analyzeImage(file, ageGroup);
       sessionStorage.setItem("safebite_result", JSON.stringify(result));
       router.push("/report");
     } catch (err: any) {
@@ -101,7 +111,7 @@ export default function ScanPage() {
               </div>
               <input
                 type="file"
-                accept="image/*,.pdf"
+                accept="image/*"
                 className="hidden"
                 onChange={(e) => {
                   const f = e.target.files?.[0];
@@ -116,7 +126,7 @@ export default function ScanPage() {
         <section className="mb-8">
           <h2 className="font-headline text-xl text-on-surface mb-1">Age Group Risk Profile</h2>
           <p className="text-xs text-on-surface-variant mb-4 font-body">Analysis sensitivity adjusts based on age requirements.</p>
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             {AGE_GROUPS.map((a) => (
               <button
                 key={a.value}

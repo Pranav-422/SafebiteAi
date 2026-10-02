@@ -1,51 +1,103 @@
 """
 Safe Bite AI – Flask Backend
-Run:  python app.py
-Deps: pip install flask flask-cors pymysql pillow pytesseract bcrypt pyjwt python-dotenv
+
+Dev:   python app.py                    (needs JWT_SECRET in backend/.env, see .env.example)
+Prod:  gunicorn -c gunicorn.conf.py app:app
 """
 
-import os, re, json, base64, datetime
-from shutil import which
+import base64
+import binascii
+import datetime
+import io
+import json
+import logging
+import os
+import re
+import secrets
+import sqlite3
+import threading
+import time
+import uuid
 from functools import wraps
+from shutil import which
 
 import bcrypt
 import jwt
-import sqlite3
-from dotenv import load_dotenv
-from flask import Flask, jsonify, request, g
-from flask_cors import CORS
-from PIL import Image
 import pytesseract
-import io
+from dotenv import load_dotenv
+from flask import Flask, g, jsonify, request
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from PIL import Image, UnidentifiedImageError
+from werkzeug.exceptions import HTTPException
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-# Load backend/.env so DB and JWT settings are available in local/dev runs.
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+import seed_data
+from safety_engine import (AGE_GROUPS, ALLOWED_RESTRICTIONS, IngredientIndex, analyze_ingredients,
+                           parse_ingredients)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
+                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("safebite")
+
+
+# ─────────────────────────────────────────
+# Configuration (all from environment)
+# ─────────────────────────────────────────
+def _env_int(name, default):
+    return int(os.getenv(name, default))
+
+
+SECRET_KEY = os.getenv("JWT_SECRET", "")
+if len(SECRET_KEY) < 32:
+    raise RuntimeError(
+        "JWT_SECRET must be set to a random value of at least 32 characters. "
+        "Generate one with:  python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+    )
+TOKEN_EXPIRY_HOURS = _env_int("TOKEN_EXPIRY_HOURS", 24)
+JWT_ALGORITHM = "HS256"
+JWT_ISSUER = "safebite-api"
+
+# Relative paths are resolved against backend/, not the current working directory.
+DATABASE_PATH = os.path.join(BASE_DIR, os.getenv("DATABASE_PATH", "safebite.db"))
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
+
+MAX_REQUEST_BYTES = _env_int("MAX_REQUEST_MB", 8) * 1024 * 1024
+MAX_TEXT_CHARS = _env_int("MAX_INGREDIENT_TEXT_CHARS", 5000)
+MAX_IMAGE_PIXELS = _env_int("MAX_IMAGE_PIXELS", 25_000_000)
+OCR_MAX_SIDE = _env_int("OCR_MAX_SIDE", 2500)
+OCR_TIMEOUT_SECONDS = _env_int("OCR_TIMEOUT_SECONDS", 30)
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]+\.[^@\s]{2,}$")
+MIN_PASSWORD_LEN = 8
+MAX_PASSWORD_BYTES = 72          # bcrypt limit
+MAX_NAME_LEN = 150
+# Used to make login take the same time whether or not the email exists.
+_DUMMY_HASH = bcrypt.hashpw(secrets.token_bytes(16), bcrypt.gensalt())
+
 
 def configure_tesseract():
-    """
-    Configure pytesseract to find the binary on Windows and standard PATH setups.
-    Priority:
-    1) TESSERACT_CMD env var
-    2) Existing PATH lookup
-    3) Common Windows install locations
-    """
+    """TESSERACT_CMD env var -> PATH -> common Windows install locations."""
     env_cmd = os.getenv("TESSERACT_CMD", "").strip()
     candidates = [env_cmd] if env_cmd else []
-
     path_cmd = which("tesseract")
     if path_cmd:
         candidates.append(path_cmd)
-
     candidates.extend([
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
     ])
-
     for cmd in candidates:
         if cmd and os.path.exists(cmd):
             pytesseract.pytesseract.tesseract_cmd = cmd
             return cmd
     return None
+
 
 TESSERACT_PATH = configure_tesseract()
 
@@ -53,53 +105,102 @@ TESSERACT_PATH = configure_tesseract()
 # App setup
 # ─────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
+app.json.sort_keys = False
+if os.getenv("TRUST_PROXY", "0") == "1":
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-SECRET_KEY = os.getenv("JWT_SECRET", "safebite-dev-secret-change-in-prod")
-TOKEN_EXPIRY_HOURS = 24
+CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}},
+     allow_headers=["Content-Type", "Authorization"], methods=["GET", "POST", "PUT", "OPTIONS"])
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    storage_uri=os.getenv("RATELIMIT_STORAGE_URI", "memory://"),
+    default_limits=[os.getenv("DEFAULT_RATE_LIMIT", "300 per minute")],
+    headers_enabled=True,
+    enabled=os.getenv("RATELIMIT_ENABLED", "1") == "1",
+)
+LOGIN_LIMIT = os.getenv("LOGIN_RATE_LIMIT", "5 per minute")
+LOGIN_IP_LIMIT = os.getenv("LOGIN_IP_RATE_LIMIT", "30 per minute")
+REGISTER_LIMIT = os.getenv("REGISTER_RATE_LIMIT", "10 per hour")
+ANALYZE_LIMIT = os.getenv("ANALYZE_RATE_LIMIT", "60 per minute")
+OCR_LIMIT = os.getenv("OCR_RATE_LIMIT", "10 per minute")
+
+
+def _login_key():
+    data = request.get_json(silent=True)
+    email = data.get("email") if isinstance(data, dict) else None
+    return f"{get_remote_address()}|{str(email).strip().lower()}"
+
+
+class ApiError(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.message, self.status = message, status
+
+
+@app.errorhandler(ApiError)
+def handle_api_error(err):
+    return jsonify({"error": err.message}), err.status
+
+
+@app.errorhandler(HTTPException)
+def handle_http_error(err):
+    messages = {413: "Request too large", 429: "Too many requests, please slow down"}
+    return jsonify({"error": messages.get(err.code, err.name)}), err.code
+
+
+@app.errorhandler(Exception)
+def handle_unexpected(err):
+    error_id = uuid.uuid4().hex[:12]
+    log.exception("Unhandled error id=%s path=%s", error_id, request.path)
+    return jsonify({"error": "Internal server error", "error_id": error_id}), 500
+
+
+@app.after_request
+def security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+    resp.headers["Cache-Control"] = "no-store"
+    if request.is_secure:
+        resp.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    return resp
+
 
 # ─────────────────────────────────────────
 # DB helpers
 # ─────────────────────────────────────────
+def _connect():
+    conn = sqlite3.connect(DATABASE_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 15000")
+    return conn
 
-SCHEMA_COMPAT_CHECKED = False
 
-class DatabaseUnavailableError(Exception):
-    pass
+def init_db():
+    """Create tables and seed reference data. Safe to run on every start."""
+    os.makedirs(os.path.dirname(os.path.abspath(DATABASE_PATH)), exist_ok=True)
+    conn = _connect()
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        with open(os.path.join(BASE_DIR, "schema.sql"), encoding="utf-8") as f:
+            conn.executescript(f.read())
+        seed_data.apply(conn)
+        conn.execute("DELETE FROM revoked_tokens WHERE expires_at < ?", (int(time.time()),))
+        conn.commit()
+    finally:
+        conn.close()
 
-def ensure_schema_compatibility(conn):
-    """
-    Keep runtime schema compatible with current app behavior.
-    Manual/OCR analysis may not have a concrete product_id.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            "ALTER TABLE product_analysis MODIFY COLUMN product_id INT NULL"
-        )
-    conn.commit()
 
 def get_db():
     if "db" not in g:
-        try:
-            db_path = os.path.join(os.path.dirname(__file__), "safebite.db")
-            conn = sqlite3.connect(db_path, timeout=10)
-            conn.row_factory = sqlite3.Row
-            g.db = conn
-        except Exception as exc:
-            app.logger.exception("Database connection failed")
-            raise DatabaseUnavailableError(
-                "Database connection failed. Verify SQLite DB path."
-            ) from exc
+        g.db = _connect()
     return g.db
 
-@app.errorhandler(DatabaseUnavailableError)
-def handle_db_unavailable(err):
-    return jsonify({"error": str(err)}), 503
-
-@app.errorhandler(sqlite3.Error)
-def handle_mysql_error(err):
-    app.logger.exception("MySQL query failed")
-    return jsonify({"error": f"Database query failed: {err}"}), 500
 
 @app.teardown_appcontext
 def close_db(_):
@@ -107,259 +208,240 @@ def close_db(_):
     if db:
         db.close()
 
-def query(sql, args=(), one=False):
-    sql = sql.replace("%s", "?")
-    cur = get_db().cursor()
-    cur.execute(sql, args)
-    rv = cur.fetchall()
-    rv = [dict(row) for row in rv]
-    return (rv[0] if rv else None) if one else rv
 
-def execute(sql, args=()):
-    sql = sql.replace("%s", "?")
-    sql = sql.replace("INSERT IGNORE", "INSERT OR IGNORE")
+def query(sql, args=(), one=False):
+    rows = [dict(r) for r in get_db().execute(sql, args).fetchall()]
+    return (rows[0] if rows else None) if one else rows
+
+
+def execute(sql, args=(), commit=True):
     db = get_db()
-    cur = db.cursor()
-    cur.execute(sql, args)
-    db.commit()
+    cur = db.execute(sql, args)
+    if commit:
+        db.commit()
     return cur.lastrowid
+
+
+# Cached matcher; rebuilt when the reference data changes.
+_index_lock = threading.Lock()
+_index_cache = {"sig": None, "index": None}
+
+
+def get_ingredient_index() -> IngredientIndex:
+    sig = tuple(get_db().execute(
+        "SELECT (SELECT COUNT(*) FROM ingredients), (SELECT MAX(id) FROM ingredients), "
+        "(SELECT COUNT(*) FROM ingredient_aliases), (SELECT COUNT(*) FROM ingredient_allergens)").fetchone())
+    with _index_lock:
+        if _index_cache["sig"] != sig:
+            rows = query("SELECT * FROM ingredients")
+            aliases = [(r["alias"], r["ingredient_id"]) for r in query("SELECT alias, ingredient_id FROM ingredient_aliases")]
+            allergens: dict[int, set[str]] = {}
+            for r in query("SELECT ia.ingredient_id, a.name FROM ingredient_allergens ia "
+                           "JOIN allergens a ON a.id = ia.allergen_id"):
+                allergens.setdefault(r["ingredient_id"], set()).add(r["name"])
+            _index_cache.update(sig=sig, index=IngredientIndex(rows, aliases, allergens))
+        return _index_cache["index"]
+
+
+# ─────────────────────────────────────────
+# Input validation helpers
+# ─────────────────────────────────────────
+def json_body() -> dict:
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+        if request.data and not request.form:
+            raise ApiError("Request body must be valid JSON")
+    if not isinstance(data, dict):
+        raise ApiError("Request body must be a JSON object")
+    return data
+
+
+def str_field(data, key, required=False, max_len=None, default=""):
+    value = data.get(key, default)
+    if value is None:
+        value = default
+    if not isinstance(value, str):
+        raise ApiError(f"'{key}' must be a string")
+    value = value.strip()
+    if required and not value:
+        raise ApiError(f"'{key}' is required")
+    if max_len and len(value) > max_len:
+        raise ApiError(f"'{key}' is too long (max {max_len} characters)")
+    return value
+
+
+def validate_age_group(value, default=None):
+    if value in (None, ""):
+        return default
+    if value not in AGE_GROUPS:
+        raise ApiError(f"age_group must be one of: {', '.join(sorted(AGE_GROUPS))}")
+    return value
+
+
+def validate_restrictions(value):
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(r, str) for r in value):
+        raise ApiError("restrictions must be a list of strings")
+    cleaned = sorted({r.strip().lower() for r in value if r.strip()})
+    unknown = [r for r in cleaned if r not in ALLOWED_RESTRICTIONS]
+    if unknown:
+        raise ApiError(f"Unknown restrictions: {', '.join(unknown)}")
+    return cleaned
+
+
+def validate_product_id(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ApiError("product_id must be an integer")
+    if not query("SELECT id FROM products WHERE id=?", (value,), one=True):
+        raise ApiError("Product not found", 404)
+    return value
+
 
 # ─────────────────────────────────────────
 # JWT auth
 # ─────────────────────────────────────────
 def generate_token(user_id: int, email: str) -> str:
+    now = datetime.datetime.now(datetime.timezone.utc)
     payload = {
-        "user_id": user_id,
-        "email":   email,
-        "exp":     datetime.datetime.utcnow() + datetime.timedelta(hours=TOKEN_EXPIRY_HOURS),
+        "sub": str(user_id),
+        "email": email,
+        "iat": now,
+        "nbf": now,
+        "exp": now + datetime.timedelta(hours=TOKEN_EXPIRY_HOURS),
+        "iss": JWT_ISSUER,
+        "jti": uuid.uuid4().hex,
     }
-    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    return jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALGORITHM)
+
 
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not token:
+        header = request.headers.get("Authorization", "")
+        if not header.startswith("Bearer ") or not header[7:].strip():
             return jsonify({"error": "Missing token"}), 401
         try:
-            payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-            g.current_user_id = payload["user_id"]
+            payload = jwt.decode(
+                header[7:].strip(), SECRET_KEY, algorithms=[JWT_ALGORITHM], issuer=JWT_ISSUER,
+                options={"require": ["exp", "iat", "sub", "jti", "iss"]},
+            )
+            user_id = int(payload["sub"])
         except jwt.ExpiredSignatureError:
             return jsonify({"error": "Token expired"}), 401
-        except jwt.InvalidTokenError:
+        except (jwt.InvalidTokenError, ValueError, TypeError):
             return jsonify({"error": "Invalid token"}), 401
+        if query("SELECT 1 FROM revoked_tokens WHERE jti=?", (payload["jti"],), one=True):
+            return jsonify({"error": "Token revoked"}), 401
+        if not query("SELECT 1 FROM users WHERE id=?", (user_id,), one=True):
+            return jsonify({"error": "Invalid token"}), 401
+        g.current_user_id = user_id
+        g.token_payload = payload
         return f(*args, **kwargs)
     return decorated
 
-# ─────────────────────────────────────────
-# Ingredient safety engine
-# ─────────────────────────────────────────
-AGE_COL = {
-    "child":  "age_child",
-    "teen":   "age_teen",
-    "adult":  "age_adult",
-    "senior": "age_senior",
-}
-
-RESTRICTION_RULES = {
-    "diabetic":           ["high fructose corn syrup", "sucralose", "aspartame", "saccharin"],
-    "hypertension":       ["sodium benzoate", "sodium nitrite", "msg", "monosodium glutamate"],
-    "vegan":              [],  # handled via is_vegan_unsafe flag
-    "vegetarian":         [],  # handled via is_vegetarian_unsafe flag
-    "nut_allergy":        ["peanut"],  # also checks allergen table
-    "lactose_intolerant": ["milk"],
-    "gluten_intolerant":  ["gluten"],
-}
-
-RISK_SCORE_MAP = {"high": 2.4, "medium": 1.3, "low": 0.6, "safe": 0.0}
-RESTRICTION_MAP = {"avoid": 1.6, "limit": 1.3, "moderate": 1.1, "safe": 1.0}
-SCORE_MAX = 10
-MIN_RISK_BUDGET = 6.0
-RISK_BUDGET_PER_INGREDIENT = 2.5
-
-def parse_ingredients(raw_text: str) -> list[str]:
-    """Normalize raw ingredient text into a clean list."""
-    raw_text = raw_text.lower()
-    raw_text = re.sub(r"\bingredients?\b\s*[:\-]?", " ", raw_text)
-    raw_text = re.sub(r"\(.*?\)", " ", raw_text)   # remove parenthetical
-    raw_text = re.sub(r"[^a-z0-9 ,;/\n]", " ", raw_text)
-    raw_text = re.sub(r"\s+", " ", raw_text).strip()
-    items = [i.strip() for i in re.split(r"[,;/\n]", raw_text) if i.strip()]
-    return items
-
-def _match_ingredient(raw_name: str, db_map: dict[str, dict]) -> dict | None:
-    raw = re.sub(r"\s+", " ", raw_name.strip().lower())
-    if not raw:
-        return None
-
-    for db_name, db_row in db_map.items():
-        escaped = re.escape(db_name)
-        pattern = rf"(^|[^a-z0-9]){escaped}([^a-z0-9]|$)"
-        if re.search(pattern, raw):
-            return db_row
-
-    for db_name, db_row in db_map.items():
-        if db_name in raw or raw in db_name:
-            return db_row
-
-    return None
-
-def _grade_for_score(score: int) -> str:
-    if score >= 8:
-        return "A"
-    if score >= 6:
-        return "B"
-    if score >= 4:
-        return "C"
-    if score >= 2:
-        return "D"
-    return "F"
-
-def analyze_ingredients(ingredients: list[str], age_group: str, restrictions: list[str]) -> dict:
-    """
-    Core safety engine.
-    Returns: safety_score (0-10), status, flagged list, and detail per ingredient.
-    """
-    age_col = AGE_COL.get(age_group, "age_adult")
-    all_db_ingredients = query(
-        f"SELECT id, name, risk_level, reason, category, {age_col} AS age_restriction, "
-        f"is_vegan_unsafe, is_vegetarian_unsafe FROM ingredients"
-    )
-    db_map = {row["name"].lower(): row for row in all_db_ingredients}
-
-    flagged = []
-    total_risk = 0.0
-    ingredient_details = []
-
-    matched_count = 0
-    for raw_name in ingredients:
-        matched_row = _match_ingredient(raw_name, db_map)
-
-        if matched_row:
-            matched_count += 1
-            base = RISK_SCORE_MAP.get(matched_row["risk_level"], 0)
-            mult = RESTRICTION_MAP.get(matched_row["age_restriction"], 1.0)
-
-            # Extra penalty for user's health restrictions
-            restriction_hit = False
-            for r in restrictions:
-                r_lower = r.lower()
-                if r_lower in ("vegan",) and matched_row["is_vegan_unsafe"]:
-                    mult = max(mult, 1.8)
-                    restriction_hit = True
-                elif r_lower in ("vegetarian",) and matched_row["is_vegetarian_unsafe"]:
-                    mult = max(mult, 1.8)
-                    restriction_hit = True
-                elif r_lower in RESTRICTION_RULES:
-                    if matched_row["name"].lower() in RESTRICTION_RULES[r_lower]:
-                        mult = max(mult, 1.4)
-                        restriction_hit = True
-
-            score = base * mult
-            total_risk += score
-
-            if score > 0:
-                flagged.append({
-                    "id":           matched_row["id"],
-                    "name":         matched_row["name"],
-                    "risk_level":   matched_row["risk_level"],
-                    "category":     matched_row["category"],
-                    "reason":       matched_row["reason"],
-                    "age_restriction": matched_row["age_restriction"],
-                    "restriction_hit": restriction_hit,
-                    "risk_score":   round(score, 1),
-                })
-
-        ingredient_details.append({
-            "raw":     raw_name,
-            "matched": matched_row["name"] if matched_row else None,
-            "flagged": matched_row is not None and (RISK_SCORE_MAP.get(matched_row["risk_level"], 0) > 0),
-        })
-
-    # Score on a 0-10 scale. Coverage penalty prevents misleading perfect scores when matches are sparse.
-    coverage = (matched_count / len(ingredients)) if ingredients else 0.0
-    coverage_penalty = 0.0
-    if coverage < 0.25:
-        coverage_penalty = round((0.25 - coverage) * 4.8, 1)
-
-    risk_budget = max(MIN_RISK_BUDGET, len(ingredients) * RISK_BUDGET_PER_INGREDIENT)
-    normalized_risk = min(1.0, total_risk / risk_budget)
-    raw_score = SCORE_MAX * (1.0 - normalized_risk) - coverage_penalty
-    safety_score = max(0, min(SCORE_MAX, int(round(raw_score))))
-    grade = _grade_for_score(safety_score)
-
-    if safety_score >= 7:
-        status = "safe"
-    elif safety_score >= 4:
-        status = "moderate"
-    else:
-        status = "unsafe"
-
-    return {
-        "safety_score":      safety_score,
-        "score_out_of":      SCORE_MAX,
-        "grade":             grade,
-        "match_confidence":  round(coverage, 2),
-        "status":            status,
-        "flagged":           sorted(flagged, key=lambda x: -x["risk_score"]),
-        "ingredient_details": ingredient_details,
-        "total_ingredients": len(ingredients),
-        "matched_count":     matched_count,
-        "flagged_count":     len(flagged),
-    }
 
 # ─────────────────────────────────────────
 # OCR helper
 # ─────────────────────────────────────────
+def load_image_bytes(data: dict) -> bytes:
+    if "image" in request.files:
+        return request.files["image"].read()
+    b64 = data.get("image_base64")
+    if not isinstance(b64, str) or not b64.strip():
+        raise ApiError("No image provided")
+    if b64.startswith("data:"):
+        b64 = b64.split(",", 1)[-1]
+    try:
+        return base64.b64decode(b64.strip(), validate=True)
+    except (binascii.Error, ValueError):
+        raise ApiError("image_base64 is not valid base64")
+
+
 def extract_text_from_image(image_bytes: bytes) -> str:
     if not TESSERACT_PATH:
-        raise RuntimeError(
-            "Tesseract binary not found. Install Tesseract OCR or set TESSERACT_CMD in backend/.env."
-        )
-    img = Image.open(io.BytesIO(image_bytes))
-    # Pre-process for better OCR
-    img = img.convert("L")          # grayscale
-    text = pytesseract.image_to_string(img, config="--psm 6")
-    return text
+        raise ApiError("OCR is not available on this server", 503)
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        if img.width * img.height > MAX_IMAGE_PIXELS:
+            raise ApiError("Image resolution too large", 413)
+        img.load()
+    except Image.DecompressionBombError:
+        raise ApiError("Image resolution too large", 413)
+    except (UnidentifiedImageError, OSError, SyntaxError):
+        raise ApiError("File is not a supported image", 400)
+    img = img.convert("L")
+    if max(img.size) > OCR_MAX_SIDE:
+        img.thumbnail((OCR_MAX_SIDE, OCR_MAX_SIDE))
+    try:
+        return pytesseract.image_to_string(img, config="--psm 6", timeout=OCR_TIMEOUT_SECONDS)
+    except RuntimeError:                       # pytesseract raises RuntimeError on timeout
+        raise ApiError("OCR timed out, try a smaller or clearer image", 422)
+    except pytesseract.TesseractError:
+        log.exception("Tesseract failed")
+        raise ApiError("Could not read text from image", 422)
+
 
 # ─────────────────────────────────────────
 # Routes – Auth
 # ─────────────────────────────────────────
 @app.route("/api/auth/register", methods=["POST"])
+@limiter.limit(REGISTER_LIMIT)
 def register():
-    data = request.get_json()
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "")
-    full_name = data.get("full_name", "")
+    data = json_body()
+    email = str_field(data, "email", required=True, max_len=255).lower()
+    password = data.get("password")
+    full_name = str_field(data, "full_name", max_len=MAX_NAME_LEN)
 
-    if not email or not password:
-        return jsonify({"error": "Email and password required"}), 400
+    if not EMAIL_RE.match(email):
+        raise ApiError("Please enter a valid email address")
+    if not isinstance(password, str) or len(password) < MIN_PASSWORD_LEN:
+        raise ApiError(f"Password must be at least {MIN_PASSWORD_LEN} characters")
+    if len(password.encode()) > MAX_PASSWORD_BYTES:
+        raise ApiError(f"Password must be at most {MAX_PASSWORD_BYTES} bytes")
 
-    existing = query("SELECT id FROM users WHERE email=%s", (email,), one=True)
-    if existing:
+    if query("SELECT id FROM users WHERE email=?", (email,), one=True):
         return jsonify({"error": "Email already registered"}), 409
 
     pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    user_id = execute(
-        "INSERT INTO users (email, password_hash, full_name) VALUES (%s,%s,%s)",
-        (email, pw_hash, full_name)
-    )
-    token = generate_token(user_id, email)
-    return jsonify({"token": token, "user_id": user_id, "email": email}), 201
+    try:
+        user_id = execute("INSERT INTO users (email, password_hash, full_name) VALUES (?,?,?)",
+                          (email, pw_hash, full_name))
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Email already registered"}), 409
+    return jsonify({"token": generate_token(user_id, email), "user_id": user_id, "email": email}), 201
 
 
 @app.route("/api/auth/login", methods=["POST"])
+@limiter.limit(LOGIN_IP_LIMIT)
+@limiter.limit(LOGIN_LIMIT, key_func=_login_key)
 def login():
-    data = request.get_json()
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "")
-
-    user = query("SELECT * FROM users WHERE email=%s", (email,), one=True)
-    if not user or not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
+    data = json_body()
+    email = data.get("email")
+    password = data.get("password")
+    if not isinstance(email, str) or not isinstance(password, str):
         return jsonify({"error": "Invalid credentials"}), 401
+    pw = password.encode()[:MAX_PASSWORD_BYTES]
 
-    token = generate_token(user["id"], user["email"])
-    return jsonify({"token": token, "user_id": user["id"], "email": user["email"]}), 200
+    user = query("SELECT * FROM users WHERE email=?", (email.strip().lower(),), one=True)
+    stored = user["password_hash"].encode() if user else _DUMMY_HASH
+    ok = bcrypt.checkpw(pw, stored)            # always run bcrypt -> no timing oracle
+    if not user or not ok:
+        return jsonify({"error": "Invalid credentials"}), 401
+    return jsonify({"token": generate_token(user["id"], user["email"]),
+                    "user_id": user["id"], "email": user["email"]}), 200
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+@require_auth
+def logout():
+    execute("INSERT OR IGNORE INTO revoked_tokens (jti, expires_at) VALUES (?,?)",
+            (g.token_payload["jti"], int(g.token_payload["exp"])))
+    return jsonify({"message": "Logged out"})
+
 
 # ─────────────────────────────────────────
 # Routes – User Profile
@@ -367,27 +449,38 @@ def login():
 @app.route("/api/user/profile", methods=["GET"])
 @require_auth
 def get_profile():
-    user = query("SELECT id, email, full_name, age_group, created_at FROM users WHERE id=%s",
+    user = query("SELECT id, email, full_name, age_group, created_at FROM users WHERE id=?",
                  (g.current_user_id,), one=True)
-    restrictions = query("SELECT restriction FROM user_restrictions WHERE user_id=%s",
-                         (g.current_user_id,))
-    user["restrictions"] = [r["restriction"] for r in restrictions]
+    user["restrictions"] = [r["restriction"] for r in
+                            query("SELECT restriction FROM user_restrictions WHERE user_id=? ORDER BY restriction",
+                                  (g.current_user_id,))]
     return jsonify(user)
 
 
 @app.route("/api/user/profile", methods=["PUT"])
 @require_auth
 def update_profile():
-    data = request.get_json()
-    execute("UPDATE users SET full_name=%s, age_group=%s WHERE id=%s",
-            (data.get("full_name"), data.get("age_group", "adult"), g.current_user_id))
+    """Partial update: only fields present in the body are changed."""
+    data = json_body()
+    updates = {}
+    if "full_name" in data:
+        updates["full_name"] = str_field(data, "full_name", max_len=MAX_NAME_LEN)
+    if "age_group" in data:
+        updates["age_group"] = validate_age_group(data["age_group"], default="adult")
+    restrictions = validate_restrictions(data["restrictions"]) if "restrictions" in data else None
 
-    # Replace restrictions
-    execute("DELETE FROM user_restrictions WHERE user_id=%s", (g.current_user_id,))
-    for r in data.get("restrictions", []):
-        execute("INSERT IGNORE INTO user_restrictions (user_id, restriction) VALUES (%s,%s)",
-                (g.current_user_id, r))
+    db = get_db()
+    with db:  # single transaction
+        if updates:
+            cols = ", ".join(f"{k}=?" for k in updates)
+            db.execute(f"UPDATE users SET {cols}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (*updates.values(), g.current_user_id))
+        if restrictions is not None:
+            db.execute("DELETE FROM user_restrictions WHERE user_id=?", (g.current_user_id,))
+            db.executemany("INSERT OR IGNORE INTO user_restrictions (user_id, restriction) VALUES (?,?)",
+                           [(g.current_user_id, r) for r in restrictions])
     return jsonify({"message": "Profile updated"})
+
 
 # ─────────────────────────────────────────
 # Routes – Products
@@ -396,15 +489,13 @@ def update_profile():
 def list_products():
     category = request.args.get("category")
     if category:
-        products = query("SELECT * FROM products WHERE category=%s ORDER BY name", (category,))
-    else:
-        products = query("SELECT * FROM products ORDER BY category, name")
-    return jsonify(products)
+        return jsonify(query("SELECT * FROM products WHERE category=? ORDER BY name", (category,)))
+    return jsonify(query("SELECT * FROM products ORDER BY category, name"))
 
 
 @app.route("/api/products/<int:product_id>", methods=["GET"])
 def get_product(product_id):
-    product = query("SELECT * FROM products WHERE id=%s", (product_id,), one=True)
+    product = query("SELECT * FROM products WHERE id=?", (product_id,), one=True)
     if not product:
         return jsonify({"error": "Not found"}), 404
     return jsonify(product)
@@ -412,190 +503,164 @@ def get_product(product_id):
 
 @app.route("/api/products/barcode/<barcode>", methods=["GET"])
 def get_by_barcode(barcode):
-    product = query("SELECT * FROM products WHERE barcode=%s", (barcode,), one=True)
+    product = query("SELECT * FROM products WHERE barcode=?", (barcode[:64],), one=True)
     if not product:
         return jsonify({"error": "Product not found"}), 404
     return jsonify(product)
 
+
 # ─────────────────────────────────────────
 # Routes – Analysis
 # ─────────────────────────────────────────
+def _user_context(data: dict, form_age=None):
+    """Resolve age group (request -> profile -> adult) and restrictions (profile + request)."""
+    user = query("SELECT age_group FROM users WHERE id=?", (g.current_user_id,), one=True)
+    profile_age = user["age_group"] if user and user["age_group"] in AGE_GROUPS else "adult"
+    age_group = validate_age_group(form_age or data.get("age_group"), default=profile_age)
+
+    profile_restrictions = [r["restriction"] for r in
+                            query("SELECT restriction FROM user_restrictions WHERE user_id=?", (g.current_user_id,))]
+    req_restrictions = data.get("restrictions")
+    if req_restrictions is None and request.form.get("restrictions"):
+        try:
+            req_restrictions = json.loads(request.form["restrictions"])
+        except ValueError:
+            raise ApiError("restrictions must be a JSON list")
+    restrictions = sorted(set(profile_restrictions) | set(validate_restrictions(req_restrictions)))
+    return age_group, restrictions
+
+
+def _run_analysis(ingredients, age_group, restrictions, product_id, scan_type, raw_text):
+    result = analyze_ingredients(ingredients, age_group, restrictions, get_ingredient_index())
+    db = get_db()
+    with db:
+        analysis_id = db.execute(
+            "INSERT INTO product_analysis (product_id, user_id, safety_score, status, age_group, detected_flags) "
+            "VALUES (?,?,?,?,?,?)",
+            (product_id, g.current_user_id, result["safety_score"], result["status"], age_group,
+             json.dumps([f["id"] for f in result["flagged"]])),
+        ).lastrowid
+        db.execute(
+            "INSERT INTO scan_history (user_id, product_id, scan_type, ocr_raw_text, result_id) VALUES (?,?,?,?,?)",
+            (g.current_user_id, product_id, scan_type, raw_text, analysis_id),
+        )
+    result["analysis_id"] = analysis_id
+    result["alternatives"] = (query("SELECT * FROM alternatives WHERE product_id=?", (product_id,))
+                              if product_id and result["status"] in ("unsafe", "moderate") else [])
+    return result
+
+
 @app.route("/api/analyze/text", methods=["POST"])
 @require_auth
+@limiter.limit(ANALYZE_LIMIT)
 def analyze_text():
-    """Analyze from manually entered ingredient text."""
-    data = request.get_json()
-    raw_text   = data.get("ingredients_text", "")
-    age_group  = data.get("age_group", "adult")
-    product_id = data.get("product_id")
+    data = json_body()
+    raw_text = str_field(data, "ingredients_text", required=True, max_len=MAX_TEXT_CHARS)
+    product_id = validate_product_id(data.get("product_id"))
+    age_group, restrictions = _user_context(data)
 
-    user = query("SELECT age_group FROM users WHERE id=%s", (g.current_user_id,), one=True)
-    restrictions_rows = query(
-        "SELECT restriction FROM user_restrictions WHERE user_id=%s", (g.current_user_id,))
-    profile_restrictions = [r["restriction"] for r in restrictions_rows]
-    request_restrictions = data.get("restrictions", []) or []
-    restrictions = sorted(set(profile_restrictions + [str(r).strip().lower() for r in request_restrictions if str(r).strip()]))
-
-    age_group = age_group or (user["age_group"] if user else "adult")
     ingredients = parse_ingredients(raw_text)
     if not ingredients:
         return jsonify({"error": "No ingredients found in provided text"}), 422
-    result = analyze_ingredients(ingredients, age_group, restrictions)
-
-    # Persist analysis
-    analysis_id = execute(
-        "INSERT INTO product_analysis (product_id, user_id, safety_score, status, age_group, detected_flags) "
-        "VALUES (%s,%s,%s,%s,%s,%s)",
-        (product_id, g.current_user_id, result["safety_score"], result["status"],
-         age_group, json.dumps([f["id"] for f in result["flagged"]]))
-    )
-
-    # Log scan
-    execute(
-        "INSERT INTO scan_history (user_id, product_id, scan_type, ocr_raw_text, result_id) "
-        "VALUES (%s,%s,'manual',%s,%s)",
-        (g.current_user_id, product_id, raw_text, analysis_id)
-    )
-
-    # Fetch alternatives if unsafe/moderate
-    alternatives = []
-    if product_id and result["status"] in ("unsafe", "moderate"):
-        alternatives = query("SELECT * FROM alternatives WHERE product_id=%s", (product_id,))
-
-    result["analysis_id"] = analysis_id
-    result["alternatives"] = alternatives
-    return jsonify(result)
+    return jsonify(_run_analysis(ingredients, age_group, restrictions, product_id, "manual", raw_text))
 
 
 @app.route("/api/analyze/image", methods=["POST"])
 @require_auth
+@limiter.limit(OCR_LIMIT)
 def analyze_image():
-    """Upload image → OCR → analyze."""
-    data = request.get_json(silent=True) or {}
-    if "image" not in request.files and "image_base64" not in data:
-        return jsonify({"error": "No image provided"}), 400
+    """Upload image (multipart 'image' or JSON 'image_base64') -> OCR -> analyze."""
+    data = request.get_json(silent=True)
+    data = data if isinstance(data, dict) else {}
+    image_bytes = load_image_bytes(data)
+    age_group, restrictions = _user_context(data, form_age=request.form.get("age_group"))
 
-    if "image" in request.files:
-        image_bytes = request.files["image"].read()
-    else:
-        b64 = data["image_base64"]
-        image_bytes = base64.b64decode(b64)
-
-    try:
-        ocr_text = extract_text_from_image(image_bytes)
-    except Exception as e:
-        return jsonify({"error": f"OCR failed: {str(e)}"}), 422
-
-    age_group = request.form.get("age_group") or data.get("age_group", "adult")
-
-    restrictions_rows = query(
-        "SELECT restriction FROM user_restrictions WHERE user_id=%s", (g.current_user_id,))
-    restrictions = [r["restriction"] for r in restrictions_rows]
-
+    ocr_text = extract_text_from_image(image_bytes)
     ingredients = parse_ingredients(ocr_text)
     if not ingredients:
         return jsonify({"error": "No ingredients found in image", "ocr_text": ocr_text}), 422
 
-    result = analyze_ingredients(ingredients, age_group, restrictions)
-
-    analysis_id = execute(
-        "INSERT INTO product_analysis (product_id, user_id, safety_score, status, age_group, detected_flags) "
-        "VALUES (%s,%s,%s,%s,%s,%s)",
-        (None, g.current_user_id, result["safety_score"], result["status"],
-         age_group, json.dumps([f["id"] for f in result["flagged"]]))
-    )
-    execute(
-        "INSERT INTO scan_history (user_id, scan_type, ocr_raw_text, result_id) "
-        "VALUES (%s,'image',%s,%s)",
-        (g.current_user_id, ocr_text, analysis_id)
-    )
-
+    result = _run_analysis(ingredients, age_group, restrictions, None, "image", ocr_text[:MAX_TEXT_CHARS])
     result["ocr_text"] = ocr_text
-    result["analysis_id"] = analysis_id
-    result["alternatives"] = []
     return jsonify(result)
 
 
 @app.route("/api/analyze/product/<int:product_id>", methods=["POST"])
 @require_auth
+@limiter.limit(ANALYZE_LIMIT)
 def analyze_product(product_id):
-    """Analyze a known product from DB."""
-    product = query("SELECT * FROM products WHERE id=%s", (product_id,), one=True)
+    product = query("SELECT * FROM products WHERE id=?", (product_id,), one=True)
     if not product:
         return jsonify({"error": "Product not found"}), 404
-
-    data = request.get_json() or {}
-    age_group = data.get("age_group", "adult")
-
-    restrictions_rows = query(
-        "SELECT restriction FROM user_restrictions WHERE user_id=%s", (g.current_user_id,))
-    restrictions = [r["restriction"] for r in restrictions_rows]
+    data = json_body()
+    age_group, restrictions = _user_context(data)
 
     ingredients = parse_ingredients(product["raw_ingredients"] or "")
-    result = analyze_ingredients(ingredients, age_group, restrictions)
-
-    analysis_id = execute(
-        "INSERT INTO product_analysis (product_id, user_id, safety_score, status, age_group, detected_flags) "
-        "VALUES (%s,%s,%s,%s,%s,%s)",
-        (product_id, g.current_user_id, result["safety_score"], result["status"],
-         age_group, json.dumps([f["id"] for f in result["flagged"]]))
-    )
-    execute(
-        "INSERT INTO scan_history (user_id, product_id, scan_type, result_id) "
-        "VALUES (%s,%s,'image',%s)",
-        (g.current_user_id, product_id, analysis_id)
-    )
-
-    alternatives = query("SELECT * FROM alternatives WHERE product_id=%s", (product_id,))
-    result["product"]      = product
-    result["analysis_id"]  = analysis_id
-    result["alternatives"] = alternatives
+    result = _run_analysis(ingredients, age_group, restrictions, product_id, "product", None)
+    result["product"] = product
+    if result["status"] in ("unsafe", "moderate"):
+        result["alternatives"] = query("SELECT * FROM alternatives WHERE product_id=?", (product_id,))
     return jsonify(result)
 
+
 # ─────────────────────────────────────────
-# Routes – History
+# Routes – History / reference
 # ─────────────────────────────────────────
 @app.route("/api/history", methods=["GET"])
 @require_auth
 def get_history():
-    rows = query(
+    return jsonify(query(
         """SELECT sh.id, sh.scan_type, sh.scanned_at,
                   p.name AS product_name, p.category,
                   pa.safety_score, pa.status
            FROM scan_history sh
-           LEFT JOIN products p         ON sh.product_id = p.id
+           LEFT JOIN products p          ON sh.product_id = p.id
            LEFT JOIN product_analysis pa ON sh.result_id  = pa.id
-           WHERE sh.user_id = %s
-           ORDER BY sh.scanned_at DESC
+           WHERE sh.user_id = ?
+           ORDER BY sh.scanned_at DESC, sh.id DESC
            LIMIT 50""",
-        (g.current_user_id,)
-    )
-    return jsonify(rows)
+        (g.current_user_id,)))
 
-# ─────────────────────────────────────────
-# Routes – Ingredients reference
-# ─────────────────────────────────────────
+
 @app.route("/api/ingredients", methods=["GET"])
 def list_ingredients():
     risk = request.args.get("risk")
     if risk:
-        rows = query("SELECT * FROM ingredients WHERE risk_level=%s ORDER BY name", (risk,))
-    else:
-        rows = query("SELECT * FROM ingredients ORDER BY risk_level DESC, name")
-    return jsonify(rows)
+        return jsonify(query("SELECT * FROM ingredients WHERE risk_level=? ORDER BY name", (risk,)))
+    return jsonify(query("SELECT * FROM ingredients ORDER BY risk_level DESC, name"))
+
+
+@app.route("/api/restrictions", methods=["GET"])
+def list_restrictions():
+    return jsonify(sorted(ALLOWED_RESTRICTIONS))
+
 
 # ─────────────────────────────────────────
-# Health check
+# Health checks
 # ─────────────────────────────────────────
 @app.route("/api/health")
+@limiter.exempt
 def health():
-    return jsonify({
-        "status": "ok",
-        "version": "1.0.0",
-        "tesseract_ready": bool(TESSERACT_PATH),
-        "tesseract_path": TESSERACT_PATH,
-    })
+    """Liveness: process is up."""
+    return jsonify({"status": "ok", "version": "1.1.0"})
 
-# ─────────────────────────────────────────
+
+@app.route("/api/ready")
+@limiter.exempt
+def ready():
+    """Readiness: DB reachable and OCR binary present."""
+    try:
+        get_db().execute("SELECT 1").fetchone()
+        db_ok = True
+    except sqlite3.Error:
+        log.exception("Readiness DB check failed")
+        db_ok = False
+    ok = db_ok and bool(TESSERACT_PATH)
+    return jsonify({"status": "ready" if ok else "degraded", "database": db_ok,
+                    "ocr": bool(TESSERACT_PATH)}), (200 if ok else 503)
+
+
+init_db()
+
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=os.getenv("FLASK_DEBUG", "0") == "1", host="127.0.0.1", port=_env_int("PORT", 5000))

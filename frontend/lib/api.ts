@@ -1,16 +1,36 @@
 // lib/api.ts  – centralised fetch wrapper for Flask backend
 
-const DEFAULT_BASES = ["http://127.0.0.1:5000/api", "http://localhost:5000/api"] as const;
+const TOKEN_KEY = "safebite_token";
 
-function getApiBases() {
+function getApiBase() {
   const envBase = process.env.NEXT_PUBLIC_API_URL?.trim();
-  if (!envBase) return [...DEFAULT_BASES];
-  return [envBase, ...DEFAULT_BASES.filter(b => b !== envBase)];
+  if (envBase) return envBase.replace(/\/+$/, "");
+  // Only fall back to a local backend during development; production must be configured explicitly.
+  if (process.env.NODE_ENV !== "production") return "http://localhost:5000/api";
+  throw new Error("NEXT_PUBLIC_API_URL is not configured.");
 }
 
-function getToken() {
+export function getToken() {
   if (typeof window === "undefined") return null;
-  return localStorage.getItem("safebite_token");
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+export function setToken(token: string) {
+  localStorage.setItem(TOKEN_KEY, token);
+}
+
+export function clearSession() {
+  localStorage.removeItem(TOKEN_KEY);
+  sessionStorage.removeItem("safebite_result");
+}
+
+function handleUnauthorized() {
+  clearSession();
+  if (typeof window !== "undefined" && window.location.pathname !== "/login") {
+    // Called outside React components, so a hard navigation is intended here.
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+    window.location.assign("/login");
+  }
 }
 
 async function req<T>(
@@ -18,34 +38,24 @@ async function req<T>(
   options: RequestInit = {},
   authenticated = false
 ): Promise<T> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    ...(options.headers as Record<string, string>),
-  };
+  const headers: Record<string, string> = { ...(options.headers as Record<string, string>) };
+  // Let the browser set the multipart boundary for FormData bodies.
+  if (!(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
   if (authenticated) {
     const token = getToken();
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-  }
-
-  let res: Response | null = null;
-  let lastNetworkError = false;
-  const bases = getApiBases();
-
-  for (const base of bases) {
-    try {
-      res = await fetch(`${base}${path}`, { ...options, headers });
-      lastNetworkError = false;
-      break;
-    } catch {
-      lastNetworkError = true;
+    if (!token) {
+      handleUnauthorized();
+      throw new Error("Please log in again.");
     }
+    headers["Authorization"] = `Bearer ${token}`;
   }
 
-  if (!res && lastNetworkError) {
-    throw new Error(`Cannot connect to API (${bases[0]}). Start backend and verify NEXT_PUBLIC_API_URL.`);
-  }
-  if (!res) {
-    throw new Error("Request failed before reaching API.");
+  const base = getApiBase();
+  let res: Response;
+  try {
+    res = await fetch(`${base}${path}`, { ...options, headers });
+  } catch {
+    throw new Error("Cannot reach the SafeBite server. Please check your connection and try again.");
   }
 
   const raw = await res.text();
@@ -56,8 +66,11 @@ async function req<T>(
     data = {};
   }
 
+  if (res.status === 401 && authenticated) {
+    handleUnauthorized();
+  }
   if (!res.ok) {
-    throw new Error(data.error ?? raw ?? `Request failed (${res.status})`);
+    throw new Error(data.error ?? `Request failed (${res.status})`);
   }
   return data as T;
 }
@@ -68,6 +81,14 @@ export async function login(email: string, password: string) {
     "/auth/login",
     { method: "POST", body: JSON.stringify({ email, password }) }
   );
+}
+
+export async function logout() {
+  try {
+    if (getToken()) await req<{ message: string }>("/auth/logout", { method: "POST" }, true);
+  } finally {
+    clearSession();
+  }
 }
 
 export async function register(email: string, password: string, full_name: string) {
@@ -91,12 +112,12 @@ export async function updateProfile(data: Partial<UserProfile>) {
 
 // ── Products ──────────────────────────────────────────────────────
 export async function getProducts(category?: string) {
-  const qs = category ? `?category=${category}` : "";
+  const qs = category ? `?category=${encodeURIComponent(category)}` : "";
   return req<Product[]>(`/products${qs}`);
 }
 
 export async function getProductByBarcode(barcode: string) {
-  return req<Product>(`/products/barcode/${barcode}`);
+  return req<Product>(`/products/barcode/${encodeURIComponent(barcode)}`);
 }
 
 // ── Analysis ──────────────────────────────────────────────────────
@@ -119,11 +140,16 @@ export async function analyzeProduct(product_id: number, age_group: string) {
   }, true);
 }
 
-export async function analyzeImageBase64(image_base64: string, age_group: string) {
-  return req<AnalysisResult>("/analyze/image", {
-    method: "POST",
-    body: JSON.stringify({ image_base64, age_group }),
-  }, true);
+export async function analyzeImage(image: Blob, age_group: string, restrictions?: string[]) {
+  const form = new FormData();
+  form.append("image", image, "label.jpg");
+  form.append("age_group", age_group);
+  if (restrictions?.length) form.append("restrictions", JSON.stringify(restrictions));
+  return req<AnalysisResult>("/analyze/image", { method: "POST", body: form }, true);
+}
+
+export async function getRestrictions() {
+  return req<string[]>("/restrictions");
 }
 
 // ── History ───────────────────────────────────────────────────────
@@ -161,6 +187,8 @@ export interface FlaggedIngredient {
   age_restriction: string;
   restriction_hit: boolean;
   risk_score: number;
+  matched_as?: string;
+  trace?: boolean;
 }
 
 export interface Alternative {
@@ -172,6 +200,18 @@ export interface Alternative {
   score_delta: number;
 }
 
+export interface AllergenAlert {
+  ingredient: string;
+  allergen: string;
+  restriction: string;
+  trace: boolean;
+}
+
+export interface DietConflict {
+  ingredient: string;
+  restriction: string;
+}
+
 export interface AnalysisResult {
   safety_score: number;
   score_out_of?: number;
@@ -179,7 +219,11 @@ export interface AnalysisResult {
   match_confidence?: number;
   status: "safe" | "moderate" | "unsafe";
   flagged: FlaggedIngredient[];
-  ingredient_details: { raw: string; matched: string | null; flagged: boolean }[];
+  allergen_alerts?: AllergenAlert[];
+  diet_conflicts?: DietConflict[];
+  restrictions_applied?: string[];
+  age_group?: AgeGroup;
+  ingredient_details: { raw: string; matched: string | null; matches?: string[]; flagged: boolean }[];
   total_ingredients: number;
   matched_count?: number;
   flagged_count: number;

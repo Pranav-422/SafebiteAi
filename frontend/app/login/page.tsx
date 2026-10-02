@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { login, register } from "@/lib/api";
+import { login, register, setToken } from "@/lib/api";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -20,7 +20,7 @@ export default function LoginPage() {
         mode === "login"
           ? await login(email, password)
           : await register(email, password, fullName);
-      localStorage.setItem("safebite_token", data.token);
+      setToken(data.token);
       router.push("/dashboard");
     } catch (e: any) {
       setError(e.message ?? "Something went wrong");

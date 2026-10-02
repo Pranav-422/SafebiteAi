@@ -1,7 +1,8 @@
 "use client";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { getToken, logout as apiLogout } from "@/lib/api";
 
 const navLinks = [
   { href: "/dashboard", label: "Home",        icon: "dashboard" },
@@ -15,8 +16,13 @@ export default function Navbar() {
   const router = useRouter();
   const [menuOpen, setMenuOpen] = useState(false);
 
-  function logout() {
-    localStorage.removeItem("safebite_token");
+  // Every page that renders the Navbar requires a session.
+  useEffect(() => {
+    if (!getToken()) router.replace("/login");
+  }, [router]);
+
+  async function logout() {
+    await apiLogout().catch(() => {});
     router.push("/login");
   }
 
